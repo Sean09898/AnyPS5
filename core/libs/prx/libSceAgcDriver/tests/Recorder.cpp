@@ -5500,19 +5500,44 @@ bool unitShadowTests(const Device& device, Recorder& recorder) {
     return true;
 }
 
-void idlePublishWaitTests(const Device& device, Recorder& recorder) {
+bool idlePublishWaitTests(const Device& device, Recorder& recorder) {
     using namespace AgcDriver::GuestMemory;
     const auto& context = device.GetContext();
     constexpr std::uint64_t unit = 65536;
     constexpr std::size_t bytes = 8 * unit;
+#ifdef _WIN32
+    // Preserve the original Windows watched host import test.
     void* block = AllocateWatched(bytes, 65536);
     Require(block != nullptr, "unit shadows are on without write watching");
     struct Release {
         void* block;
         ~Release() { ReleaseWatched(block, bytes); }
     } release{block};
+#else
+    // Linux: use shared-backed guest direct memory so the DMA-BUF path is exercised.
+    // Anonymous MAP_PRIVATE memory cannot be selected for that import path.
+    std::int64_t physical = 0;
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, bytes, unit, 0, &physical) == 0,
+            "idle publish: cannot allocate shared-backed direct memory");
+    void* block = nullptr;
+    if (sceKernelMapDirectMemory(&block, bytes, 0x33, 0, physical, unit) != 0) {
+        sceKernelReleaseDirectMemory(physical, bytes);
+        throw std::runtime_error("idle publish: cannot map shared-backed direct memory");
+    }
+    struct Release {
+        void* block;
+        std::int64_t physical;
+        ~Release() {
+            if (block != nullptr) sceKernelMunmap(reinterpret_cast<std::uint64_t>(block), bytes);
+            sceKernelReleaseDirectMemory(physical, bytes);
+        }
+    } release{block, physical};
+#endif
     std::memset(block, 0x11, bytes);
     const auto address = reinterpret_cast<std::uint64_t>(block);
+#ifdef _WIN32
+    // Anonymous Windows fixture needs an explicit registry entry. Direct-memory
+    // guest mappings on Linux are registered by sceKernelMapDirectMemory.
     {
         GuestAllocations::Mutation mutation;
         mutation.Add(block, bytes, true, true, true);
@@ -5529,11 +5554,20 @@ void idlePublishWaitTests(const Device& device, Recorder& recorder) {
             HostImportFor(context, address, bytes);
         }
     } unregister{context, block, address};
+#endif
     const auto* import = HostImportFor(context, address, bytes);
     if (import == nullptr || !Watched(address, bytes)) {
         std::cout << "host import of the idle publish test block refused or not watched: idle publish wait not tested\n";
-        return;
+        return false;
     }
+#ifndef _WIN32
+    // Never silently report success if this fixture used an unsafe host pointer.
+    if (!HostImportUsesDmaBuf(context, address, bytes)) {
+        std::cout << "skipped, idle publish fixture did not use DMA-BUF\n";
+        return false;
+    }
+    std::cout << "idle publish fixture uses DMA-BUF\n";
+#endif
     recorder.Sync();
     CollectWritesUncached(address, bytes);
     auto* words = static_cast<std::uint8_t*>(block);
@@ -5574,6 +5608,7 @@ void idlePublishWaitTests(const Device& device, Recorder& recorder) {
     Require(words[5 * unit] == 0x55 && words[6 * unit - 1] == 0x55, "the label flush's publish did not land: the unit read as written after its retile, so the publish dropped it as stale");
     Require(pending, "a publish of a flush other than the idle one was waited");
     std::cout << "idle publish wait verified\n";
+    return true;
 }
 
 void storageRefreshTests(const Device& device, Recorder& recorder, bool watched) {
@@ -12120,8 +12155,7 @@ int main(int argc, char** argv) {
                 std::cout << "skipped, unit shadows or host imports are unavailable\n";
                 return 77;
             }
-            idlePublishWaitTests(device, recorder);
-            return 0;
+            return idlePublishWaitTests(device, recorder) ? 0 : 77;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--unit-shadow-only") {
             if (!AgcDriver::Graphics::UnitShadowEnabled() || device.GetContext().hostImportAlignment == 0) {

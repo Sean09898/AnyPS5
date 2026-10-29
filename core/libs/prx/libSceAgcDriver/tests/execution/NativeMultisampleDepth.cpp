@@ -118,13 +118,21 @@ public:
             }
             const auto supported = [&](const char* name) { return std::any_of(extensions.begin(), extensions.end(), [&](const auto& item) { return std::strcmp(item.extensionName, name) == 0; }); };
             const bool externalHostExtensions = supported(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME) && supported(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
-            const std::array<const char*, 2> externalHostNames{VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME, VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME};
+            // Enable DMA-BUF as well as host-pointer imports when the platform supports it.
+        const std::array<const char*, 4> externalImportNames{
+            VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME, VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME,
+            VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME};
             VkPhysicalDeviceBufferDeviceAddressFeatures address{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};
             if (externalHostExtensions) {
                 VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &address};
                 function<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(context.physical, &features);
             }
             const bool externalHost = externalHostExtensions && address.bufferDeviceAddress == VK_TRUE;
+#ifndef _WIN32
+        const bool externalDmaBuf = externalHost && supported(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME) && supported(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
+#else
+        const bool externalDmaBuf = false;
+#endif
             address.pNext = nullptr;
             address.bufferDeviceAddressCaptureReplay = VK_FALSE;
             address.bufferDeviceAddressMultiDevice = VK_FALSE;
@@ -132,8 +140,8 @@ public:
             device.queueCreateInfoCount = 1u;
             device.pQueueCreateInfos = &queue;
             device.pEnabledFeatures = &enabled;
-            device.enabledExtensionCount = externalHost ? static_cast<std::uint32_t>(externalHostNames.size()) : 0u;
-            device.ppEnabledExtensionNames = externalHost ? externalHostNames.data() : nullptr;
+            device.enabledExtensionCount = externalHost ? (externalDmaBuf ? 4u : 2u) : 0u;
+            device.ppEnabledExtensionNames = externalHost ? externalImportNames.data() : nullptr;
             Check(function<PFN_vkCreateDevice>("vkCreateDevice")(context.physical, &device, nullptr, &context.device), "vkCreateDevice");
             if (externalHost) {
                 VkPhysicalDeviceExternalMemoryHostPropertiesEXT host{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
@@ -141,6 +149,7 @@ public:
                 function<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(context.physical, &properties);
                 context.hostImportAlignment = host.minImportedHostPointerAlignment;
                 context.bufferDeviceAddress = true;
+                context.dmaBufImport = externalDmaBuf;
             }
             context.deviceProc = function<PFN_vkGetDeviceProcAddr>("vkGetDeviceProcAddr");
             context.formatProperties = function<PFN_vkGetPhysicalDeviceFormatProperties>("vkGetPhysicalDeviceFormatProperties");
